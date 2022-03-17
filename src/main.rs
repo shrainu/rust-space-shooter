@@ -1,6 +1,7 @@
 #![feature(drain_filter)]
 
 use bevy::prelude::*;
+use rand::prelude::*;
 
 // Collision Layers
 const COLLISION_LAYER_PLAYER: u8 = 0b00000001;
@@ -19,6 +20,8 @@ fn main() {
         .add_startup_system(spawn_player)
         .add_plugins(DefaultPlugins)
         .add_event::<OnCollisionEnterEvent>()
+        .add_system_to_stage(CoreStage::First, spawn_enemy_system)
+        .add_system_to_stage(CoreStage::PreUpdate, entity_healthbar_added)
         .add_system(player_movement_input)
         .add_system(move_entity)
         .add_system(lock_bounded_entity)
@@ -26,6 +29,8 @@ fn main() {
         .add_system(check_collision_entity)
         .add_system(on_projectile_collision_enter)
         .add_system(entity_lifespan_system)
+        .add_system(entity_health_system)
+        .add_system(entity_healthbar_system)
         .run();
 }
 
@@ -93,6 +98,15 @@ struct Lifespan {
     current: u64,
 }
 
+#[derive(Component)]
+struct Health {
+    max: i32,
+    current: i32,
+}
+
+#[derive(Component)]
+struct HealthBar;
+
 struct OnCollisionEnterEvent {
     this: Entity,
     other: Entity,
@@ -132,13 +146,68 @@ fn spawn_player(windows: Res<Windows>, mut commands: Commands) {
             projectile_color: Color::rgb(0.0, 1.0, 0.0),
             projectile_size: Vec2::new(4.0, 12.0),
             projectile_speed: 12.0,
-            projectile_lifespan: 2000
+            projectile_lifespan: 2000,
         })
         .insert(PhysicsBody {
             self_layer_mask: COLLISION_LAYER_PLAYER,
             target_layer_maks: COLLISION_LAYER_ENEMY,
         })
         .insert(Collider { collided: vec![] });
+}
+
+fn spawn_enemy(window: &Window, mut commands: Commands) {
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                color: Color::rgb(0.4, 0.1, 0.6),
+                ..Default::default()
+            },
+            transform: Transform {
+                scale: Vec3::new(60.0, 60.0, 1.0),
+                translation: Vec3::new(
+                    rand::thread_rng().gen_range(-270..270) as f32,
+                    rand::thread_rng().gen_range(-200..370) as f32,
+                    1.0,
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .insert(Bounded {
+            x: 0.0 - window.width() / 2.0,
+            y: 0.0 - window.height() / 2.0,
+            width: window.width(),
+            height: window.height(),
+        })
+        .insert(PhysicsBody {
+            self_layer_mask: COLLISION_LAYER_ENEMY,
+            target_layer_maks: COLLISION_LAYER_PLAYER,
+        })
+        .insert(Collider { collided: vec![] })
+        .insert(Health { max: 5, current: 5 })
+        .insert(HealthBar)
+        .insert(Enemy);
+}
+
+fn spawn_enemy_system(windows: Res<Windows>, time: Res<Time>, mut commands: Commands) {
+    static mut CURRENT: u64 = 0;
+    const SPAWN_INTERVAL: u64 = 5000;
+
+    let mut spawn = false;
+
+    let window = windows.get_primary().unwrap();
+
+    unsafe {
+        CURRENT += time.delta().as_millis() as u64;
+        if CURRENT >= SPAWN_INTERVAL {
+            spawn = true;
+            CURRENT = 0;
+        }
+    }
+
+    if spawn {
+        spawn_enemy(window, commands);
+    }
 }
 
 fn player_movement_input(
@@ -242,10 +311,12 @@ fn entity_shoot_projectile(
 }
 
 fn rect_to_rect_collision(rect: &Transform, other: &Transform) -> bool {
-    let collision_x = rect.translation.x + rect.scale.x / 2.0 >= other.translation.x
-        && other.translation.x + other.scale.x / 2.0 >= rect.translation.x;
-    let collision_y = rect.translation.y + rect.scale.y / 2.0 >= other.translation.y
-        && other.translation.y + other.scale.y / 2.0 >= rect.translation.y;
+    let collision_x = rect.translation.x + rect.scale.x / 2.0
+        >= other.translation.x - other.scale.x / 2.0
+        && other.translation.x + other.scale.x / 2.0 >= rect.translation.x - rect.scale.x / 2.0;
+    let collision_y = rect.translation.y + rect.scale.y / 2.0
+        >= other.translation.y - other.scale.y / 2.0
+        && other.translation.y + other.scale.y / 2.0 >= rect.translation.y - rect.scale.y / 2.0;
 
     return collision_x && collision_y;
 }
@@ -308,12 +379,17 @@ fn on_projectile_collision_enter(
     mut commands: Commands,
     mut collision_events: EventReader<OnCollisionEnterEvent>,
     query: Query<(Entity, &Projectile)>,
+    mut other: Query<&mut Health, With<Collider>>,
 ) {
     for event in collision_events.iter() {
         for (entity, _) in query.iter() {
             if entity == event.this {
-                commands.entity(event.other).despawn();
-                // commands.entity(event.this).despawn(); TODO: Uncomment later
+                if let Ok(mut health) = other.get_component_mut::<Health>(event.other) {
+                    health.as_mut().current -= 1;
+                    commands.entity(event.this).despawn();
+                } else {
+                    commands.entity(event.other).despawn();
+                }
             }
         }
     }
@@ -335,5 +411,51 @@ fn entity_lifespan_system(
 
     for entity in to_delete {
         commands.entity(entity).despawn();
+    }
+}
+
+fn entity_health_system(mut commands: Commands, mut query: Query<(Entity, &mut Health)>) {
+    for (entity, health) in query.iter_mut() {
+        if health.current <= 0 {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
+fn entity_healthbar_added(mut commands: Commands, query: Query<Entity, Added<HealthBar>>) {
+    for entity in query.iter() {
+        let child = commands
+            .spawn_bundle(SpriteBundle {
+                sprite: Sprite {
+                    color: Color::rgb(1.0, 0.0, 0.0),
+                    ..Default::default()
+                },
+                transform: Transform {
+                    scale: Vec3::new(1.0, 0.1, 1.0),
+                    translation: Vec3::new(0.0, 0.6, 1.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .id();
+
+        commands.entity(entity).add_child(child);
+    }
+}
+
+fn entity_healthbar_system(
+    mut child_query: Query<(&Parent, &mut Transform)>,
+    parent_query: Query<&Health, With<HealthBar>>
+) {
+    for (parent, mut transform) in child_query.iter_mut() {
+        
+        let parent_health = parent_query.get(parent.0);
+        if let Ok(health) = parent_health {
+
+            let ratio = health.current as f32 / health.max as f32;
+
+            transform.scale.x = ratio;
+            transform.translation.x = ratio / 2.0 - 0.5;
+        }
     }
 }
