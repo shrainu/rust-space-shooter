@@ -7,6 +7,9 @@ use rand::prelude::*;
 const COLLISION_LAYER_PLAYER: u8 = 0b00000001;
 const COLLISION_LAYER_ENEMY: u8 = 0b00000010;
 
+// Stars
+const STAR_SPAWN_TIME: u64 = 500;
+
 fn main() {
     App::new()
         .insert_resource(WindowDescriptor {
@@ -16,12 +19,14 @@ fn main() {
             resizable: false,
             ..Default::default()
         })
+        .insert_resource(ClearColor(Color::rgb(0.06, 0.025, 0.125)))
         .add_startup_system(setup_camera)
         .add_startup_system(spawn_player)
         .add_plugins(DefaultPlugins)
         .add_event::<OnCollisionEnterEvent>()
         .add_system_to_stage(CoreStage::First, spawn_enemy_system)
         .add_system_to_stage(CoreStage::PreUpdate, entity_healthbar_added)
+        .add_system_to_stage(CoreStage::PreUpdate, spawn_star_system)
         .add_system(player_movement_input)
         .add_system(move_entity)
         .add_system(lock_bounded_entity)
@@ -29,6 +34,7 @@ fn main() {
         .add_system(check_collision_entity)
         .add_system(on_projectile_collision_enter)
         .add_system(entity_lifespan_system)
+        .add_system(destroy_out_of_window_system)
         .add_system(entity_health_system)
         .add_system(entity_healthbar_system)
         .run();
@@ -112,6 +118,12 @@ struct OnCollisionEnterEvent {
     other: Entity,
 }
 
+#[derive(Component)]
+struct Star;
+
+#[derive(Component)]
+struct DestroyOutOfWindow;
+
 fn spawn_player(windows: Res<Windows>, mut commands: Commands) {
     let window = windows.get_primary().unwrap();
 
@@ -123,6 +135,7 @@ fn spawn_player(windows: Res<Windows>, mut commands: Commands) {
             },
             transform: Transform {
                 scale: Vec3::new(60.0, 60.0, 1.0),
+                translation: Vec3::new(0.0, 0.0, 2.0),
                 ..Default::default()
             },
             ..Default::default()
@@ -137,11 +150,11 @@ fn spawn_player(windows: Res<Windows>, mut commands: Commands) {
             height: window.height(),
         })
         .insert(AutoShoot {
-            shoot_interval: 1000,
+            shoot_interval: 750,
             current_interval: 0,
         })
         .insert(Shooter {
-            shoot_positions: vec![Vec2::new(32.0, 32.0), Vec2::new(-32.0, 32.0)],
+            shoot_positions: vec![Vec2::new(28.0, 32.0), Vec2::new(-28.0, 32.0)],
             projectile_direction: Direction { x: 0.0, y: 1.0 },
             projectile_color: Color::rgb(0.0, 1.0, 0.0),
             projectile_size: Vec2::new(4.0, 12.0),
@@ -163,10 +176,10 @@ fn spawn_enemy(window: &Window, mut commands: Commands) {
                 ..Default::default()
             },
             transform: Transform {
-                scale: Vec3::new(60.0, 60.0, 1.0),
+                scale: Vec3::new(60.0, 60.0, 2.0),
                 translation: Vec3::new(
-                    rand::thread_rng().gen_range(-270..270) as f32,
-                    rand::thread_rng().gen_range(-200..370) as f32,
+                    rand::thread_rng().gen_range(-270.0..270.0f32),
+                    rand::thread_rng().gen_range(460.0..=520.0f32),
                     1.0,
                 ),
                 ..Default::default()
@@ -175,9 +188,9 @@ fn spawn_enemy(window: &Window, mut commands: Commands) {
         })
         .insert(Bounded {
             x: 0.0 - window.width() / 2.0,
-            y: 0.0 - window.height() / 2.0,
+            y: 0.0 - window.height(),
             width: window.width(),
-            height: window.height(),
+            height: window.height() * 2.0,
         })
         .insert(PhysicsBody {
             self_layer_mask: COLLISION_LAYER_ENEMY,
@@ -186,7 +199,10 @@ fn spawn_enemy(window: &Window, mut commands: Commands) {
         .insert(Collider { collided: vec![] })
         .insert(Health { max: 5, current: 5 })
         .insert(HealthBar)
-        .insert(Enemy);
+        .insert(Enemy)
+        .insert(Speed(2.5))
+        .insert(Direction { x: 0.0, y: -1.0 })
+        .insert(DestroyOutOfWindow);
 }
 
 fn spawn_enemy_system(windows: Res<Windows>, time: Res<Time>, mut commands: Commands) {
@@ -414,7 +430,10 @@ fn entity_lifespan_system(
     }
 }
 
-fn entity_health_system(mut commands: Commands, mut query: Query<(Entity, &mut Health)>) {
+fn entity_health_system(
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Health), Changed<Health>>,
+) {
     for (entity, health) in query.iter_mut() {
         if health.current <= 0 {
             commands.entity(entity).despawn_recursive();
@@ -445,17 +464,79 @@ fn entity_healthbar_added(mut commands: Commands, query: Query<Entity, Added<Hea
 
 fn entity_healthbar_system(
     mut child_query: Query<(&Parent, &mut Transform)>,
-    parent_query: Query<&Health, With<HealthBar>>
+    parent_query: Query<(&Health, With<HealthBar>), Changed<Health>>,
 ) {
-    for (parent, mut transform) in child_query.iter_mut() {
-        
-        let parent_health = parent_query.get(parent.0);
-        if let Ok(health) = parent_health {
+    if parent_query.is_empty() {
+        return;
+    }
 
+    for (parent, mut transform) in child_query.iter_mut() {
+        let parent_health = parent_query.get(parent.0);
+        if let Ok((health, _)) = parent_health {
             let ratio = health.current as f32 / health.max as f32;
 
             transform.scale.x = ratio;
             transform.translation.x = ratio / 2.0 - 0.5;
+        }
+    }
+}
+
+fn spawn_star_system(mut commands: Commands, time: Res<Time>) {
+    static mut CURRENT: u64 = 0;
+
+    let mut spawn = false;
+
+    unsafe {
+        CURRENT += time.delta().as_millis() as u64;
+        if CURRENT >= STAR_SPAWN_TIME {
+            spawn = true;
+            CURRENT = 0;
+        }
+    }
+
+    if spawn {
+        let spawn_count: i32 = rand::thread_rng().gen_range(10..=25);
+        for _ in 0..spawn_count {
+            let spawn_pos = Vec3::new(
+                rand::thread_rng().gen_range(-300.0..=300.0),
+                rand::thread_rng().gen_range(420.0..500.0),
+                1.0,
+            );
+
+            let size: f32 = rand::thread_rng().gen_range(2.0..=5.0);
+
+            let speed: f32 = rand::thread_rng().gen_range(2.0..=8.0) * (size / 5.0);
+
+            commands
+                .spawn_bundle(SpriteBundle {
+                    sprite: Sprite {
+                        color: Color::rgb(1.0, 1.0, 1.0),
+                        ..Default::default()
+                    },
+                    transform: Transform {
+                        translation: spawn_pos,
+                        scale: Vec3::new(size, size, 1.0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .insert(Star)
+                .insert(Speed(speed))
+                .insert(Direction { x: 0.0, y: -1.0 });
+        }
+    }
+}
+
+fn destroy_out_of_window_system(
+    windows: Res<Windows>,
+    mut commands: Commands,
+    query: Query<(Entity, &Transform), With<DestroyOutOfWindow>>,
+) {
+    let window = windows.get_primary().unwrap();
+
+    for (entity, transform) in query.iter() {
+        if transform.translation.y + (transform.scale.y / 2.0) <= 0.0 - (window.height() / 2.0) {
+            commands.entity(entity).despawn_recursive();
         }
     }
 }
